@@ -1,13 +1,13 @@
+{-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE TypeApplications #-}
 
 module Core where
 
 import Context (Idx (..), Lvl, Name, Names (..), PiMode (..), type (+++))
-import Data.Data (Proxy (..), type (:~:) (Refl))
+import Data.Data (Proxy (..))
 import Data.Kind (Type)
 import Data.Singletons (Sing)
-import Data.Type.Equality ((:~:))
 
 data Nat = Z | S Nat
 
@@ -21,26 +21,32 @@ data Spine :: Type -> Arity -> Type where
 
 data Tel :: (Names -> Type) -> Arity -> Names -> Type where
   TNil :: Tel f Empty ms
-  TCons :: forall {ms} m {f} {as}. f ms -> Tel f as (ms :< m) -> Tel f ((Empty :< m) +++ as) ms
+  TCons ::
+    forall {ms} n {p} {f} {as}.
+    f ms ->
+    Tel f as (ms :< '(p, n)) ->
+    Tel f ((Empty :< '(p, n)) +++ as) ms
 
 data Stage = Obj | Mta
 
-data Binder :: Stage -> (PiMode, Name) -> Names -> Type where
-  Lam :: Binder s n ns
-  -- rhs
-  Let :: Tm ns -> Binder s n ns
-  -- rhs
-  LetIrr :: Tm ns -> Binder Obj n ns
+type Ty ns = Tm ns
+
+data Binder :: forall tm. tm -> Stage -> (PiMode, Name) -> Names -> Type where
+  Lam :: Binder tm s n ns
+  -- ty, val
+  Let :: tm ns -> tm ns -> Binder tm s n ns
+  -- ty, val
+  LetIrr :: tm ns -> tm ns -> Binder tm Obj n ns
   -- a, b, A
-  PiObj :: Tm ns -> Tm ns -> Tm ns -> Binder Obj n ns
+  PiObj :: tm ns -> tm ns -> tm ns -> Binder tm Obj n ns
   -- A
-  PiMta :: Tm ns -> Binder Mta n ns
+  PiMta :: tm ns -> Binder tm Mta n ns
 
 data Tm :: Names -> Type where
   Var :: Idx ns -> Tm ns
   Meta :: MetaVar -> Tm ns
   App :: Tm ns -> Spine k t -> Tm ns
-  Bind :: Sing s -> Sing n -> Binder s n ns -> Tm (ns :< n) -> Tm ns
+  Bind :: Sing s -> Sing n -> Binder Tm s n ns -> Tm (ns :< n) -> Tm ns
   Prim :: Prim ks ns -> Spine (Tm ns) ks -> Tm ns
 
 type Env ms ns = Tel Val ns ms
@@ -49,23 +55,23 @@ data Closure :: (PiMode, Name) -> Names -> Type where
   Cl :: Env ns ms -> Tm (ms :< n) -> Closure n ns
 
 data Val :: Names -> Type where
-  VRigid :: Lvl ns -> Spine k t -> Val ns
-  VFlex :: MetaVar -> Spine k t -> Val ns
-  VBind :: Sing s -> Sing n -> Binder s n ns -> Closure n ns -> Val ns
-  VPrim :: Prim ks ns -> Spine (Val ns) ks -> Val ns
+  VRigid :: Lvl ns -> Spine ks t -> Val ns
+  VFlex :: MetaVar -> Spine ks t -> Val ns
+  VBind :: Sing s -> Sing n -> Binder Val s n ns -> Closure n ns -> Val ns
+  VPrim :: Prim ks ns -> Spine (Val ns) ks -> Spine (Val ns) ks' -> Val ns
 
 -- No need to deal with deBrujin
 class In (n :: Name) (ns :: Names) where
-  find :: Proxy n -> Idx ns
+  idx :: Proxy n -> Idx ns
 
   var :: Proxy n -> Tm ns
-  var x = Var (find x)
+  var x = Var (idx x)
 
 instance In n (ns :< '(m, n)) where
-  find _ = IZ
+  idx _ = IZ
 
 instance {-# OVERLAPS #-} (In n ns) => In n (ns :< n') where
-  find x = IS (find x)
+  idx x = IS (idx x)
 
 data Prim :: Arity -> Names -> Type where
   PrimTYP :: Prim Empty ns
@@ -83,10 +89,15 @@ data Prim :: Arity -> Names -> Type where
   PrimZero :: Prim Empty ns
   PrimPlusBYTES :: Prim (Empty :< '(Explicit, "a") :< '(Explicit, "b")) ns
   PrimPlusBytes :: Prim (Empty :< '(Explicit, "a") :< '(Explicit, "b")) ns -- could probably merge
+  PrimPAIR :: Prim (Empty :< '(Explicit, "a") :< '(Explicit, "b")) ns
+  PrimMkPAIR :: Prim (Empty :< '(Explicit, "a") :< '(Explicit, "b") :< '(Explicit, "valA") :< '(Explicit, "valB")) ns
+  PrimFST :: Prim (Empty :< '(Explicit, "a") :< '(Explicit, "b") :< '(Explicit, "p")) ns
+  PrimSND :: Prim (Empty :< '(Explicit, "a") :< '(Explicit, "b") :< '(Explicit, "p")) ns
+  PrimPair :: Prim (Empty :< '(Explicit, "bytesA") :< '(Explicit, "a") :< '(Explicit, "bytesB") :< '(Explicit, "b")) ns
   PrimPadT :: Prim (Empty :< '(Explicit, "bytes")) ns
   PrimPad :: Prim (Empty :< '(Implicit, "bytes")) ns
   PrimMake :: Prim (Empty :< '(Implicit, "bytes") :< '(Explicit, "ty")) ns
-  PrimBox :: Prim (Empty :< '(Explicit, "x")) ns
+  PrimBoxT :: Prim (Empty :< '(Implicit, "bytes") :< '(Explicit, "ty")) ns
   PrimGive :: Prim (Empty :< '(Explicit, "x")) ns
   PrimBool :: Prim Empty ns
   PrimBOOL :: Prim Empty ns
@@ -127,6 +138,12 @@ pattern Code b c = Prim PrimCode (Cons b (Cons c Nil))
 
 pattern Size :: Tm ns
 pattern Size = Prim PrimSize Nil
+
+pattern Ptr :: Tm ns
+pattern Ptr = Prim PrimPtr Nil
+
+pattern PadT :: Tm ns -> Tm ns
+pattern PadT b = Prim PrimPadT (Cons b Nil)
 
 primType :: Prim ks ns -> (Tel Tm ks ns, Tm (ns +++ ks))
 primType PrimTYP = (TNil, TYP)
@@ -176,5 +193,13 @@ primType PrimSize = (TNil, BYTES)
 primType PrimZero = (TNil, BYTES)
 primType PrimPlusBYTES = (TCons BYTES (TCons BYTES TNil), BYTES)
 primType PrimPlusBytes = (TCons Bytes (TCons Bytes TNil), Bytes)
-
--- primType PrimPadT = (
+primType PrimPadT = (TCons @"bytes" Bytes TNil, UnsizedTyp (var @"bytes" Proxy))
+primType PrimPad = (TCons @"bytes" Bytes TNil, PadT (var @"bytes" Proxy))
+primType PrimMake =
+  ( TCons @"bytes" Bytes (TCons (UnsizedTyp (var @"bytes" Proxy)) TNil),
+    SizedTyp Ptr
+  )
+primType PrimBoxT =
+  ( TCons @"bytes" Bytes (TCons (UnsizedTyp (var @"bytes" Proxy)) TNil),
+    SizedTyp Ptr
+  )
